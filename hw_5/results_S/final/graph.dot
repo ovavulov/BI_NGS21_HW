@@ -3,6 +3,6 @@ digraph {
 1;
 2;
 3;
-3 -> 0 [label="Len:893;Cov:155.7"];
 2 -> 1 [label="Len:893;Cov:155.7"];
+0 -> 3 [label="Len:893;Cov:155.7"];
 }

@@ -9,7 +9,7 @@ import pandas as pd
 import json
 import pydot
 from copy import deepcopy
-from numba import njit
+from itertools import product
 
 
 def get_antisense(seq):
@@ -70,36 +70,57 @@ def build_debruijn_graph(
                 adjlist[rc_source].add(rc_target)
             except KeyError:
                 adjlist[rc_source] = {rc_target}
-    # adjacency matrix return
+    # adjacency lists return
     adjlist = {x: list(y) for x, y in adjlist.items()}
-    dBGraph = nx.from_dict_of_lists(adjlist, create_using=nx.DiGraph)
-    adj_matrix = nx.convert_matrix.to_pandas_adjacency(dBGraph)
-    return adj_matrix, kmer_coverage
+    return adjlist, kmer_coverage
 
 
-def get_edges_(adj_matrix):
+def get_edges(adjlist):
     """
     Build edge table by adjacency matrix
     """
-    kmers = list(adj_matrix.columns)
-    edges = pd.DataFrame(columns=["source", "target", "edge"])
-    for s_idx, t_idx in zip(*np.where(adj_matrix == 1)):
-        edges.loc[len(edges)] = np.array(
-            [kmers[s_idx], kmers[t_idx], kmers[s_idx] + kmers[t_idx][-1]]
-        )
+    edges = []
+    for source, targets in adjlist.items():
+        for s, t in product([source], targets):
+            edges.append([s, t, s+t[-1]])
+    return pd.DataFrame(edges, columns=["source", "target", "edge"])
+
+
+
+
+def make_graph_compression_(edges_):
+    """
+    Perform De Bruijn graph compression
+    """
+    edges = deepcopy(edges_)
+    kmer_len = len(edges.iloc[0, 0])
+    source_nodes = edges.groupby("source")["edge"].count()
+    source_nodes = source_nodes[source_nodes == 1].keys().to_list()
+    target_nodes = edges.groupby("target")["edge"].count()
+    target_nodes = target_nodes[target_nodes == 1].keys().to_list()
+    uninformative_nodes = set(source_nodes) & set(target_nodes)
+    # search through the graph until no uninformative node left
+    for node in tqdm(uninformative_nodes):
+        # select edges to merge
+        merge = edges[
+            (edges.target == node) | (edges.source == node)
+        ]
+        in_kmer = merge[merge.target == node].source.values[0]
+        out_kmer = merge[merge.source == node].target.values[0]
+        # drop them at first
+        edges = edges[
+            ~((edges.target == node) | (edges.source == node))
+        ]
+#         edges.drop(index=merge.index, inplace=True)
+#         edges.reset_index(drop=True, inplace=True)
+        # and introduce new merged edge
+        new_edge = merge[merge.target == node].edge.values[0][:-kmer_len]+\
+                   merge[merge.source == node].edge.values[0]
+        new_edge = np.array([in_kmer, out_kmer, new_edge]).reshape(1, -1)
+        edges = pd.concat([edges, pd.DataFrame(new_edge, columns=edges.columns)], axis=0)
+    edges.reset_index(drop=True, inplace=True)
     return edges
 
-
-def get_edges(adj_matrix):
-    """
-    Build edge table by adjacency matrix
-    """
-    kmers = adj_matrix.columns
-    edges = [
-        [kmers[s_idx], kmers[t_idx], kmers[s_idx] + kmers[t_idx][-1]] 
-        for s_idx, t_idx in zip(*np.where(adj_matrix.values == 1))
-    ]
-    return pd.DataFrame(edges, columns=["source", "target", "edge"])
 
 
 def make_graph_compression(edges_):
@@ -108,44 +129,31 @@ def make_graph_compression(edges_):
     """
     edges = deepcopy(edges_)
     kmer_len = len(edges.iloc[0, 0])
-    source_dict = dict(edges.groupby("source")["edge"].count())
-    target_dict = dict(edges.groupby("target")["edge"].count())
+    source_nodes = edges.groupby("source")["edge"].count()
+    source_nodes = source_nodes[source_nodes == 1].keys().to_list()
+    target_nodes = edges.groupby("target")["edge"].count()
+    target_nodes = target_nodes[target_nodes == 1].keys().to_list()
+    uninformative_nodes = set(source_nodes) & set(target_nodes)
     # search through the graph until no uninformative node left
-    while True:
-#         print("step")
-        kmers = set(source_dict.keys()) | set(target_dict.keys())
-        for node in kmers:
-            # define in/out degree
-            try:
-                in_degree = target_dict[node]
-            except KeyError:
-                in_degree = 0
-            try:
-                out_degree = source_dict[node]
-            except KeyError:
-                out_degree = 0
-            if in_degree == out_degree == 1: # node does not provide any information about graph structure
-                # select edges to merge
-                merge = edges[
-                    (edges.target == node) | (edges.source == node)
-                ]
-                in_kmer = merge[merge.target == node].source.values[0]
-
-                out_kmer = merge[merge.source == node].target.values[0]
-                # drop them at first
-                edges = edges[
-                    ~((edges.target == node) | (edges.source == node))
-                ]
-                edges.reset_index(drop=True, inplace=True)
-                # and introduce new merged edge
-                new_edge = merge[merge.target == node].edge.values[0][:-kmer_len]+\
-                           merge[merge.source == node].edge.values[0]
-                edges.loc[len(edges)] = [in_kmer, out_kmer, new_edge]
-                del source_dict[node], target_dict[node]
-                break
-        else:
-            break
+    edges = edges.values
+    for node in tqdm(uninformative_nodes):
+        # select edges to merge
+        drop_idxs = []
+        drop_idxs.append(np.where(edges[:, 1] == node)[0][0])
+        drop_idxs.append(np.where(edges[:, 0] == node)[0][0])
+        merge = edges[drop_idxs, :]
+        in_kmer = merge[0, 0]
+        out_kmer = merge[1, 1]
+        # drop them at first
+        edges = np.delete(edges, drop_idxs, axis=0)
+        # and introduce new merged edge
+        new_edge = merge[0, 2][:-kmer_len]+\
+                   merge[1, 2]
+        new_edge = np.array([in_kmer, out_kmer, new_edge]).reshape(1, -1)
+        edges = np.concatenate([edges, new_edge], axis=0)
+    edges = pd.DataFrame(edges, columns=["source", "target", "edge"])
     return edges
+
 
 
 def get_mean_coverage(edge, kmer_len, kmer_coverage):

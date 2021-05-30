@@ -7,10 +7,10 @@ digraph {
 5;
 6;
 7;
-5 -> 1 [label="Len:147;Cov:224.6"];
-2 -> 3 [label="Len:147;Cov:224.6"];
-1 -> 6 [label="Len:341;Cov:123.5"];
-0 -> 5 [label="Len:515;Cov:161.9"];
-7 -> 2 [label="Len:341;Cov:123.5"];
-3 -> 4 [label="Len:515;Cov:161.9"];
+1 -> 4 [label="Len:147;Cov:224.6"];
+0 -> 5 [label="Len:147;Cov:224.6"];
+5 -> 6 [label="Len:515;Cov:161.9"];
+2 -> 0 [label="Len:341;Cov:123.5"];
+4 -> 3 [label="Len:341;Cov:123.5"];
+7 -> 1 [label="Len:515;Cov:161.9"];
 }
