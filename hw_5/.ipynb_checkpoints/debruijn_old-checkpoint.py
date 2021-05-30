@@ -9,7 +9,6 @@ import pandas as pd
 import json
 import pydot
 from copy import deepcopy
-from numba import njit
 
 
 def get_antisense(seq):
@@ -32,11 +31,9 @@ def build_debruijn_graph(
     """
     assert kmer_len % 2 == 1 
     reads = fx.Fastx(path_to_reads)
-    kmer1_len = kmer_len + 1
 
     # DeBruijn graph we are growing
     dBGraph = nx.DiGraph()
-    adjlist = {}
 
     # kmers coverage statistics
     kmer_coverage = {}
@@ -51,33 +48,31 @@ def build_debruijn_graph(
         # check if read contains the valid symbols only
         assert set(read[1]) - set("ACTGN") == set()
         # scan the read by sliding window
-        for i in range(len(seq)-kmer1_len+1):
+        for i in range(len(seq)-kmer_len):
             # kmers from reads
-            edge = seq[i:i+kmer1_len]
-            source = edge[:-1]
-            target = edge[1:]
-            update_kmer_coverage(edge)
-            try:
-                adjlist[source].add(target)
-            except KeyError:
-                adjlist[source] = {target}
+            source = seq[i:i+kmer_len]
+            target = seq[i+1:i+kmer_len+1]
+            update_kmer_coverage(source)
+            pairGraph = nx.DiGraph()
+            pairGraph.add_nodes_from([source, target])
+            pairGraph.add_edge(source, target)
+            dBGraph = nx.compose(dBGraph, pairGraph) # attach kmer pair to the whole graph
             # reversed complementary kmers (the same sense)
-            rc_edge = get_antisense(edge)
-            rc_source = rc_edge[:-1]
-            rc_target = rc_edge[1:]
-            update_kmer_coverage(rc_edge)
-            try:
-                adjlist[rc_source].add(rc_target)
-            except KeyError:
-                adjlist[rc_source] = {rc_target}
+            rc_source, rc_target = reversed(list(map(get_antisense, [source, target])))
+            update_kmer_coverage(rc_target)
+            rc_pairGraph = nx.DiGraph()
+            rc_pairGraph.add_nodes_from([rc_source, rc_target])
+            rc_pairGraph.add_edge(rc_source, rc_target)
+            dBGraph = nx.compose(dBGraph, rc_pairGraph)
+        # update coverage statistics for the latest kmers (direct and reverse complementary)
+        update_kmer_coverage(target)
+        update_kmer_coverage(rc_source)
     # adjacency matrix return
-    adjlist = {x: list(y) for x, y in adjlist.items()}
-    dBGraph = nx.from_dict_of_lists(adjlist, create_using=nx.DiGraph)
     adj_matrix = nx.convert_matrix.to_pandas_adjacency(dBGraph)
     return adj_matrix, kmer_coverage
 
 
-def get_edges_(adj_matrix):
+def get_edges(adj_matrix):
     """
     Build edge table by adjacency matrix
     """
@@ -90,62 +85,47 @@ def get_edges_(adj_matrix):
     return edges
 
 
-def get_edges(adj_matrix):
-    """
-    Build edge table by adjacency matrix
-    """
-    kmers = adj_matrix.columns
-    edges = [
-        [kmers[s_idx], kmers[t_idx], kmers[s_idx] + kmers[t_idx][-1]] 
-        for s_idx, t_idx in zip(*np.where(adj_matrix.values == 1))
-    ]
-    return pd.DataFrame(edges, columns=["source", "target", "edge"])
-
-
-def make_graph_compression(edges_):
+def make_graph_compression(adj_matrix_, edges_):
     """
     Perform De Bruijn graph compression
     """
+    adj_matrix = deepcopy(adj_matrix_)
     edges = deepcopy(edges_)
-    kmer_len = len(edges.iloc[0, 0])
-    source_dict = dict(edges.groupby("source")["edge"].count())
-    target_dict = dict(edges.groupby("target")["edge"].count())
     # search through the graph until no uninformative node left
     while True:
-#         print("step")
-        kmers = set(source_dict.keys()) | set(target_dict.keys())
-        for node in kmers:
+        for node in adj_matrix.columns:
+            kmer_len = len(node)
             # define in/out degree
-            try:
-                in_degree = target_dict[node]
-            except KeyError:
-                in_degree = 0
-            try:
-                out_degree = source_dict[node]
-            except KeyError:
-                out_degree = 0
+            in_degree = adj_matrix.loc[:, node].sum()
+            out_degree = adj_matrix.loc[node, :].sum()
             if in_degree == out_degree == 1: # node does not provide any information about graph structure
+                # find neighboring kmers
+                out_kmer = np.argmax(adj_matrix.loc[node, :])
+                in_kmer = np.argmax(adj_matrix.loc[:, node])
+                # drop uninformative node and induce new link in place of it
+                adj_matrix.drop(node, axis=0, inplace=True)
+                adj_matrix.drop(node, axis=1, inplace=True)
+                adj_matrix.loc[in_kmer, out_kmer] += 1
+                # update edges information
                 # select edges to merge
                 merge = edges[
-                    (edges.target == node) | (edges.source == node)
+                    (edges.source == in_kmer) & (edges.target == node) | 
+                    (edges.target == out_kmer) & (edges.source == node)
                 ]
-                in_kmer = merge[merge.target == node].source.values[0]
-
-                out_kmer = merge[merge.source == node].target.values[0]
                 # drop them at first
                 edges = edges[
-                    ~((edges.target == node) | (edges.source == node))
+                    ~((edges.source == in_kmer) & (edges.target == node) | 
+                    (edges.target == out_kmer) & (edges.source == node))
                 ]
                 edges.reset_index(drop=True, inplace=True)
                 # and introduce new merged edge
-                new_edge = merge[merge.target == node].edge.values[0][:-kmer_len]+\
-                           merge[merge.source == node].edge.values[0]
+                new_edge = merge[merge.source == in_kmer].edge.values[0][:-kmer_len]+\
+                           merge[merge.target == out_kmer].edge.values[0]
                 edges.loc[len(edges)] = [in_kmer, out_kmer, new_edge]
-                del source_dict[node], target_dict[node]
                 break
         else:
             break
-    return edges
+    return adj_matrix, edges
 
 
 def get_mean_coverage(edge, kmer_len, kmer_coverage):
@@ -153,13 +133,13 @@ def get_mean_coverage(edge, kmer_len, kmer_coverage):
     Mean edge coverage calculation
     """
     cov_list = []
-    for i in range(len(edge)-kmer_len):
-        kmer = edge[i:i+kmer_len+1]
+    for i in range(len(edge)-kmer_len+1):
+        kmer = edge[i:i+kmer_len]
         cov_list.append(kmer_coverage[kmer])
 #         try:
 #             cov_list.append(kmer_coverage[kmer])
 #         except KeyError:
-#             cov_list.append(1)
+#              cov_list.append(1)
     return np.mean(cov_list)
 
 
@@ -173,49 +153,44 @@ def add_edges_statistics(edges_, kmer_len, kmer_coverage):
     return edges
 
 
-def remove_tips(edges_, cov_cutoff, len_cutoff):
+def remove_tips(adj_matrix_, edges_, cov_cutoff, len_cutoff):
     """
     Remove tips from builded De Bruijn graph
     """
+    adj_matrix = deepcopy(adj_matrix_)
     edges = deepcopy(edges_)
-    source_dict = dict(edges.groupby("source")["edge"].count())
-    target_dict = dict(edges.groupby("target")["edge"].count())
-    nodes = set(source_dict.keys()) | set(target_dict.keys())
+    nodes = adj_matrix.columns
     for node in nodes:
-        try:
-            in_degree = target_dict[node]
-        except KeyError:
-            in_degree = 0
-        try:
-            out_degree = source_dict[node]
-        except KeyError:
-            out_degree = 0
+        in_degree = adj_matrix.loc[:, node].sum()
+        out_degree = adj_matrix.loc[node, :].sum()
         if in_degree + out_degree == 1: # dead end condition
             edge = edges[(edges.source == node) | (edges.target == node)]
             if edge.length.values[0] < len_cutoff or edge.mean_cov.values[0] < cov_cutoff:
                 # remove edge if it doesn't meet required cut-offs
+                adj_matrix.drop(node, axis=0, inplace=True)
+                adj_matrix.drop(node, axis=1, inplace=True)
                 edges = edges[~((edges.source == node) | (edges.target == node))]
                 edges.reset_index(drop=True, inplace=True)
-                source_dict = dict(edges.groupby("source")["edge"].count())
-                target_dict = dict(edges.groupby("target")["edge"].count())
-    return edges
+    return adj_matrix, edges
 
 
-def remove_any(edges_, cov_cutoff, len_cutoff):
+def remove_any(adj_matrix_, edges_, cov_cutoff, len_cutoff):
     """
     Remove tips from builded De Bruijn graph
     """
+    adj_matrix = deepcopy(adj_matrix_)
     edges = deepcopy(edges_)
     while True:
         for i, edge in edges.iterrows():   
             if edge.length < len_cutoff or edge.mean_cov < cov_cutoff:
                 # remove edge if it doesn't meet required cut-offs
+                adj_matrix.loc[edge.source, edge.target] -= 1
                 edges.drop(index=i, inplace=True)
                 edges.reset_index(drop=True, inplace=True)
                 break
         else:
             break
-    return edges
+    return adj_matrix, edges
 
 
 def save_dot(edges, res_path, dot_file, nodes_file):
